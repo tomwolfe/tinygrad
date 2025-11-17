@@ -15,6 +15,10 @@ class TestTiny(unittest.TestCase):
     out = Tensor([1.,2,3])
     self.assertListEqual(out.tolist(), [1.0, 2.0, 3.0])
 
+  def test_elu(self):
+    out = Tensor([[1.,2],[3,4]]).sum(axis=1).elu()
+    self.assertListEqual(out.tolist(), [3.0, 7.0])
+
   def test_plus(self):
     out = Tensor([1.,2,3]) + Tensor([4.,5,6])
     self.assertListEqual(out.tolist(), [5.0, 7.0, 9.0])
@@ -28,8 +32,8 @@ class TestTiny(unittest.TestCase):
     self.assertListEqual(out.tolist(), [2]*16)
 
   def test_cat(self):
-    out = Tensor.cat(Tensor.ones(8).contiguous(), Tensor.ones(8).contiguous())
-    self.assertListEqual(out.tolist(), [1]*16)
+    out = Tensor.cat(Tensor.ones(8).contiguous(), Tensor.zeros(8).contiguous())
+    self.assertListEqual(out.tolist(), [1]*8+[0]*8)
 
   def test_sum(self):
     out = Tensor.ones(256).contiguous().sum()
@@ -58,7 +62,7 @@ class TestTiny(unittest.TestCase):
     out = Tensor.rand(10)
     for x in out.tolist():
       self.assertGreaterEqual(x, 0.0)
-      self.assertLessEqual(x, 1.0)
+      self.assertLess(x, 1.0)
 
   # *** JIT (for Python speed) ***
 
@@ -130,17 +134,15 @@ class TestTiny(unittest.TestCase):
   def test_mnist_backward(self):
     # NOTE: we don't have the whole model here for speed
     layers = [
-      nn.Conv2d(1, 32, 5), Tensor.relu,
-      nn.Conv2d(32, 32, 5), Tensor.relu]
+      nn.Conv2d(1, 8, 5), Tensor.relu,
+      nn.Conv2d(8, 8, 5), Tensor.relu]
 
     # replace random weights with ones
-    # TODO: there's a bug here where it's tying two of the biases together. we need UNIQUE const
-    #Tensor.realize(*[p.replace(Tensor.ones_like(p).contiguous()) for p in nn.state.get_parameters(layers)])
-    for p in nn.state.get_parameters(layers): p.replace(Tensor.empty(p.shape))
+    Tensor.realize(*[p.replace(Tensor.ones_like(p).contiguous()) for p in nn.state.get_parameters(layers)])
 
     # realize gradients
     for x in nn.state.get_parameters(layers): x.requires_grad_()
-    Tensor.empty(4, 1, 28, 28).sequential(layers).sum().backward()
+    Tensor.empty(4, 1, 14, 14).sequential(layers).sum().backward()
     Tensor.realize(*[x.grad for x in nn.state.get_parameters(layers) if x.grad is not None])
 
   # *** image ***
