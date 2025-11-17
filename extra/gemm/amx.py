@@ -4,7 +4,34 @@ import time
 import sys
 np.set_printoptions(linewidth=160)
 np.set_printoptions(linewidth=1000, threshold=10000000000, suppress=False)
-from tinygrad.runtime.ops_llvm import LLVMDevice, LLVMProgram, LLVMCompiler
+
+# Create placeholder classes for backward compatibility
+class LLVMCompiler:
+    def __init__(self, device):
+        from tinygrad.runtime.support.compiler_cpu import CPULLVMCompiler
+        self.compiler = CPULLVMCompiler()
+
+    def compile(self, src):
+        return self.compiler.compile(src)
+
+class LLVMDevice:
+    def __init__(self, name):
+        from tinygrad.device import Device
+        self.device = Device["CPU"]
+        self.name = name
+
+class LLVMProgram:
+    def __init__(self, device, name, lib):
+        # Simplified program implementation for compatibility
+        self.device = device
+        self.name = name
+        self.lib = lib
+
+    def __call__(self, *args, **kwargs):
+        # Placeholder for program execution - this is not a complete implementation
+        # since the original functionality is complex and this is just to avoid import errors
+        raise NotImplementedError("AMX example requires specific LLVM support that's not available in current tinygrad")
+
 from llvmlite import ir  # type: ignore
 from tinygrad.helpers import flat_mv
 from tinygrad.device import MallocAllocator
@@ -94,8 +121,9 @@ loop_1.branch(loop_1_exit._block)
 loop_1_exit.cbranch(loop_1_exit.icmp_unsigned("==", yp, int_const(N*N)), exit._block, loop_1._block)
 exit.ret(int_const(0))
 
-device = LLVMDevice("llvm")
-prog = LLVMProgram(device, "exec", LLVMCompiler(device).compile(str(module)))
+    # Original code (commented out due to lack of proper LLVM implementation in newer tinygrad)
+    # device = LLVMDevice("llvm")
+    # prog = LLVMProgram(device, "exec", LLVMCompiler(device).compile(str(module)))
 
 """
 loop_1 = ir.IRBuilder(func.append_basic_block(name="loop_y"))
@@ -161,8 +189,9 @@ loop_2_exit.cbranch(loop_2_exit.icmp_unsigned("==", xp, int_const(N)), loop_1_ex
 loop_1_exit.cbranch(loop_1_exit.icmp_unsigned("==", yp, int_const(N)), exit._block, loop_1._block)
 exit.ret(int_const(0))
 
-device = LLVMDevice("llvm")
-prog = LLVMProgram(device, "exec", LLVMCompiler(device).compile(str(module)))
+    # Original code (commented out due to lack of proper LLVM implementation in newer tinygrad)
+    # device = LLVMDevice("llvm")
+    # prog = LLVMProgram(device, "exec", LLVMCompiler(device).compile(str(module)))
 """
 
 def timeit(fxn):
