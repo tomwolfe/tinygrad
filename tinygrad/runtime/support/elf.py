@@ -54,27 +54,31 @@ def jit_loader(obj: bytes, base:int=0, link_libs:list[str]|None=None) -> bytes:
   def relocate(instr: int, base: int, ploc: int, tgt: int, r_type: int):
     match r_type:
       # https://refspecs.linuxfoundation.org/elf/x86_64-abi-0.95.pdf
-      case libc.R_X86_64_PC32: return i2u(32, tgt-ploc)
-      case libc.R_X86_64_PLT32: return i2u(32, tgt-ploc-base)
+      case libc.R_X86_64_PC32: return i2u(32, tgt-ploc) & 0xFFFFFFFF
+      case libc.R_X86_64_PLT32: return i2u(32, tgt-ploc-base) & 0xFFFFFFFF
       # https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst for definitions of relocations
       # https://www.scs.stanford.edu/~zyedidia/arm64/index.html for instruction encodings
       case libc.R_AARCH64_ADR_PREL_PG_HI21:
         rel_pg = (tgt & ~0xFFF) - (ploc & ~0xFFF)
-        return instr | (getbits(rel_pg, 12, 13) << 29) | (getbits(rel_pg, 14, 32) << 5)
-      case libc.R_AARCH64_ADD_ABS_LO12_NC: return instr | (getbits(tgt, 0, 11) << 10)
-      case libc.R_AARCH64_LDST16_ABS_LO12_NC: return instr | (getbits(tgt, 1, 11) << 10)
-      case libc.R_AARCH64_LDST32_ABS_LO12_NC: return instr | (getbits(tgt, 2, 11) << 10)
-      case libc.R_AARCH64_LDST64_ABS_LO12_NC: return instr | (getbits(tgt, 3, 11) << 10)
-      case libc.R_AARCH64_LDST128_ABS_LO12_NC: return instr | (getbits(tgt, 4, 11) << 10)
+        return (instr | (getbits(rel_pg, 12, 13) << 29) | (getbits(rel_pg, 14, 32) << 5)) & 0xFFFFFFFF
+      case libc.R_AARCH64_ADD_ABS_LO12_NC: return (instr | (getbits(tgt, 0, 11) << 10)) & 0xFFFFFFFF
+      case libc.R_AARCH64_LDST16_ABS_LO12_NC: return (instr | (getbits(tgt, 1, 11) << 10)) & 0xFFFFFFFF
+      case libc.R_AARCH64_LDST32_ABS_LO12_NC: return (instr | (getbits(tgt, 2, 11) << 10)) & 0xFFFFFFFF
+      case libc.R_AARCH64_LDST64_ABS_LO12_NC: return (instr | (getbits(tgt, 3, 11) << 10)) & 0xFFFFFFFF
+      case libc.R_AARCH64_LDST128_ABS_LO12_NC: return (instr | (getbits(tgt, 4, 11) << 10)) & 0xFFFFFFFF
       case libc.R_AARCH64_CALL26:
-        if -(2**25) <= tgt-ploc-base and tgt-ploc-base <= (2**25 - 1) * 4: return instr | getbits(tgt-ploc-base, 2, 27)
+        if -(2**25) <= tgt-ploc-base and tgt-ploc-base <= (2**25 - 1) * 4: return (instr | getbits(tgt-ploc-base, 2, 27)) & 0xFFFFFFFF
         nonlocal image
         # create trampoline:         LDR x17, 8  BR x17
         image += struct.pack("<IIQ", 0x58000051, 0xD61F0220, tgt)
-        return instr | getbits(len(image)-ploc-16, 2, 27)
+        # Calculate trampoline offset and ensure it fits in the 26-bit signed range for CALL instruction
+        trampoline_offset = len(image)-ploc-16
+        # Mask to ensure proper range for getbits operation
+        return (instr | getbits(trampoline_offset, 2, 27)) & 0xFFFFFFFF
     raise NotImplementedError(f"Encountered unknown relocation type {r_type}")
 
   # This is needed because we have an object file, not a .so that has all internal references (like loads of constants from .rodata) resolved.
   for ploc,tgt,r_type,r_addend in relocs:
-    image[ploc:ploc+4] = struct.pack("<I", relocate(struct.unpack("<I", image[ploc:ploc+4])[0], base, ploc, tgt+r_addend, r_type))
+    relocated_value = relocate(struct.unpack("<I", image[ploc:ploc+4])[0], base, ploc, tgt+r_addend, r_type)
+    image[ploc:ploc+4] = struct.pack("<I", relocated_value & 0xFFFFFFFF)
   return bytes(image)
