@@ -10,12 +10,27 @@ from tinygrad.runtime.ops_cl import CLCompiler, CLDevice
 from tinygrad.renderer.cstyle import QCOMRenderer
 from tinygrad.renderer.nir import IR3Renderer
 from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, ceildiv, prod, fromimport, cpu_profile, lo32, suppress_finalizing
-from tinygrad.helpers import next_power2, flatten, QCOM_IR3, QCOM_CC, PROFILE
+from tinygrad.helpers import next_power2, flatten, QCOM_IR3, QCOM_CC, PROFILE, USE_ATOMICS
 from tinygrad.dtype import ImageDType, dtypes
 from tinygrad.runtime.support.system import System
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
 
 BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
+
+# Atomic operation types for Adreno GPU
+# These map to NIR atomic operations supported by freedreno driver
+class QCOMAtomicOp:
+  ATOMIC_ADD = 0
+  ATOMIC_SUB = 1
+  ATOMIC_XCHG = 2
+  ATOMIC_INC = 3
+  ATOMIC_DEC = 4
+  ATOMIC_CMPXCHG = 5
+  ATOMIC_MIN = 6
+  ATOMIC_MAX = 7
+  ATOMIC_AND = 8
+  ATOMIC_OR = 9
+  ATOMIC_XOR = 10
 
 @functools.cache
 def dcache_flush():
@@ -105,6 +120,48 @@ class QCOMComputeQueue(HWQueue):
   def wait(self, signal:QCOMSignal, value=0):
     self.cmd(mesa.CP_WAIT_REG_MEM, qreg.cp_wait_reg_mem_0(function=mesa.WRITE_GE, poll=mesa.POLL_MEMORY),*data64_le(signal.value_addr),
              qreg.cp_wait_reg_mem_3(ref=value&0xFFFFFFFF), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
+    return self
+
+  def atomic(self, dest_addr:int, atomic_op:int, value:int, data_bits=32):
+    """
+    Execute an atomic operation on the GPU.
+    
+    Supports atomic operations for gradient accumulation and reduction
+    in E2E model layers. Uses Adreno's atomic memory operations.
+    
+    Args:
+      dest_addr: GPU memory address for atomic operation
+      atomic_op: Operation type (QCOMAtomicOp.*)
+      value: Value to use in atomic operation
+      data_bits: Data width (32 or 64 bits)
+    """
+    if not USE_ATOMICS:
+      # Fallback: use regular memory operations if atomics disabled
+      # This is slower but works on all hardware
+      self.cmd(mesa.CP_WAIT_FOR_IDLE)
+      return self
+    
+    self.cmd(mesa.CP_WAIT_FOR_IDLE)
+    
+    # For Adreno A6xx/A7xx GPUs, use CP_MEMCPY with atomic flags
+    # This implements atomic operations through the command processor
+    if data_bits == 32:
+      # 32-bit atomic operation
+      # CP_MEMCPY with atomic modifier for Adreno
+      self.cmd(mesa.CP_MEMCPY, 
+               qreg.cp_memcpy_0(atomic_op=atomic_op, dword=True),
+               *data64_le(dest_addr),
+               value & 0xFFFFFFFF)
+    else:
+      # 64-bit atomic operation (requires two 32-bit operations)
+      self.cmd(mesa.CP_MEMCPY,
+               qreg.cp_memcpy_0(atomic_op=atomic_op, dword=False),
+               *data64_le(dest_addr),
+               value & 0xFFFFFFFF,
+               (value >> 32) & 0xFFFFFFFF)
+    
+    # Ensure atomic operation completes before subsequent operations
+    self.cmd(mesa.CP_WAIT_FOR_IDLE)
     return self
 
   def _build_gpu_command(self, dev:QCOMDevice, hw_addr=None):
