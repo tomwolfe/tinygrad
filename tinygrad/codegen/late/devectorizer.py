@@ -1,22 +1,16 @@
 from typing import Any, cast
-import functools, operator, itertools
+import functools, itertools
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from tinygrad.dtype import dtypes, ImageDType, DType, AddrSpace, Invalid, PtrDType
 from tinygrad.uop.ops import UOp, Ops, UPat, PatternMatcher, GroupOp, identity_element
 from tinygrad.uop.symbolic import uop_given_valid, parse_valid, invalid_gate
-from tinygrad.helpers import getenv, flatten, AMX, prod
+from tinygrad.helpers import getenv, flatten, AMX, prod, IMAGE
 from tinygrad.renderer import Renderer
 
 # ***** image load valid simplification *****
 
-def simplify_valid_load(buf:UOp, start_idx:UOp, valid:UOp) -> UOp|None:
-  idx = uop_given_valid(valid, start_idx)
-  if not isinstance(buf.dtype, ImageDType): return None if idx is start_idx else buf.index(idx.valid(valid), ptr=True)
-
-  # wait for it to be image indexed before running simplification
-  if start_idx.dtype.count != 2: return None
-
+def _drop_valid_stmts(valid:UOp, idx:UOp, height:int, width:int) -> list[UOp]:
   # can drop valid if idx is out of bound when valid is False
   drop_stmt = []
   for stmt in valid.split_uop(Ops.AND):
@@ -33,15 +27,25 @@ def simplify_valid_load(buf:UOp, start_idx:UOp, valid:UOp) -> UOp|None:
     # if X <= c, check if it's out of bound when X = c+1
     # if X >= c, check if it's out of bound when X = c-1
     test_value = c + 1 if is_upper_bound else c - 1
-    for i,b in zip(idx.src, (buf.dtype.shape[1], buf.dtype.shape[0])):
+    for i,b in zip(idx.src, (width, height)):
       if i.is_increasing():
         rw = i.substitute({X:X.const_like(test_value)})
         if rw.vmin >= b or rw.vmax < 0:
           drop_stmt.append(stmt)
           break
+  return drop_stmt
+
+def simplify_valid_load(buf:UOp, start_idx:UOp, valid:UOp) -> UOp|None:
+  idx = uop_given_valid(valid, start_idx)
+  if not isinstance(buf.dtype, ImageDType): return None if idx is start_idx else buf.index(idx.valid(valid), ptr=True)
+
+  # wait for it to be image indexed before running simplification
+  if start_idx.dtype.count != 2: return None
+
+  drop_stmt = _drop_valid_stmts(valid, idx, buf.dtype.shape[0], buf.dtype.shape[1])
 
   if not drop_stmt and idx is start_idx: return None
-  new_valid = functools.reduce(operator.and_, ss) if (ss:=[s for s in valid.split_uop(Ops.AND) if s not in drop_stmt]) else None
+  new_valid = UOp.prod(*ss) if (ss:=[s for s in valid.split_uop(Ops.AND) if s not in drop_stmt]) else None
   return buf.index(idx.valid(new_valid) if new_valid is not None else idx, ptr=True)
 
 
@@ -179,23 +183,28 @@ def split_load_store(ctx:Renderer|None, ls:UOp, idx:UOp):
   if len(ret) <= 1: return None
   return UOp(Ops.CAT, ls.dtype, tuple(ret)) if ls.op is Ops.LOAD else UOp.group(*ret)
 
+def _do_image_fixup(dt:ImageDType, idx:UOp) -> tuple[UOp, UOp, int, int]:
+  buf = idx.src[0]
+  x, valid = idx.src[1].get_idx(), idx.src[1].get_valid()
+  h, w = dt.shape[0], dt.shape[1]
+  if IMAGE == 1 and valid is not None:
+    h, w = max(ImageDType.valid_dims(dt), key=lambda hw:
+               (len(_drop_valid_stmts(valid, idx:=uop_given_valid(valid, UOp.vectorize((x//4)%hw[1], x//(4*hw[1]))), *hw)), -len(idx.backward_slice)))
+    buf = buf.replace(dtype=(dtypes.imageh if dt.itemsize == 2 else dtypes.imagef)((h, w, 4), w * 4 * dt.itemsize))
+  oidx = UOp(Ops.VECTORIZE, dtypes.index.vec(2), ((x // 4) % w, (x // (4*w))))
+  return x, idx.replace(src=(buf, oidx.valid(valid))), w, h
+
 def image_fixup(ls:UOp):
   # normal image load or store, with the CAST from expand_index
   if ls.src[0].op is Ops.CAST and isinstance(image_dtype:=ls.src[0].src[0].dtype, ImageDType):
     assert ls.src[0].dtype.count == 4, "image must be casted to 4"
-    idx = ls.src[0].src[0]
-    x, valid = idx.src[1].get_idx(), idx.src[1].get_valid()
-    oidx = UOp(Ops.VECTORIZE, dtypes.index.vec(2), ((x // 4) % image_dtype.shape[1], (x // (4*image_dtype.shape[1]))))
-    idx = idx.replace(src=(idx.src[0], oidx.valid(valid)))
+    _, idx, _, _ = _do_image_fixup(image_dtype, ls.src[0].src[0])
     return ls.replace(src=(idx,)+ls.src[1:])
 
   # this is an unprocessed image without a cast, aka unfoldable image load. this doesn't work for stores
   if isinstance(image_dtype:=ls.src[0].dtype, ImageDType) and ls.src[0].src[1].get_idx().dtype != dtypes.index.vec(2):
     assert ls.op is Ops.LOAD, "if an image store isn't upcasted to 4, we can't store it"
-    idx = ls.src[0]
-    x, valid = idx.src[1].get_idx(), idx.src[1].get_valid()
-    oidx = UOp(Ops.VECTORIZE, dtypes.index.vec(2), ((x // 4) % image_dtype.shape[1], (x // (4*image_dtype.shape[1]))))
-    idx = idx.replace(src=(idx.src[0], oidx.valid(valid)))
+    x, idx, width, height = _do_image_fixup(image_dtype, ls.src[0])
     vec_load = ls.replace(dtype=ls.dtype.vec(4), src=(idx,)+ls.src[1:])
     # image pixels have 4 channels (.xyzw), select channel based on x % 4
     x_mod_4 = x % 4
@@ -299,8 +308,6 @@ pm_render = PatternMatcher([
 @dataclass
 class ReduceContext:
   acc_num: int = 0
-  # track ENDs by range for merging parallel reduces
-  range_to_ends: dict[tuple[UOp, ...], list[UOp]] = field(default_factory=dict)
 
 def horizontal_reduce(inp:UOp, out_dtype:DType) -> list[UOp]:
   # if this has a horizontal reduction component, do that first
@@ -326,13 +333,15 @@ def reduce_to_acc(ctx:ReduceContext, red:UOp):
     ctx.acc_num += 1
   ret = functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
   if len(reduce_range) == 0: return ret
-  end = acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range)
-  ctx.range_to_ends.setdefault(reduce_range, []).append(end)
+  end = acc.index(UOp.const(dtypes.int, 0)).store(ret).end(*reduce_range).rtag("mergeable")
   return acc.after(end).index(UOp.const(dtypes.int, 0))
 
 def merge_reduce_ends(ctx:ReduceContext, sink:UOp):
-  # merge ENDs that share the same range
-  subs = {e: UOp.group(*(e.src[0] for e in ends)).end(*r) for r, ends in ctx.range_to_ends.items() if len(ends) > 1 for e in ends}
+  # merge ENDs that share the same range (only those created by reduce_to_acc)
+  range_to_ends: dict[tuple[UOp, ...], list[UOp]] = {}
+  for u in sink.backward_slice:
+    if u.op is Ops.END and u.tag == "mergeable": range_to_ends.setdefault(u.src[1:], []).append(u)
+  subs = {e: UOp.group(*(e.src[0] for e in ends)).end(*r) for r, ends in range_to_ends.items() if len(ends) > 1 for e in ends}
   return sink.substitute(subs) if subs else None
 
 pm_reduce = PatternMatcher([

@@ -145,7 +145,7 @@ runs:
       run: |
         wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
         sudo tee /etc/apt/sources.list.d/rocm.list <<EOF
-        deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.2 $(lsb_release -cs) main
+        deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.1 $(lsb_release -cs) main
         EOF
         echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600
 
@@ -233,7 +233,7 @@ runs:
       shell: bash
       run: |
         sudo mkdir -p /usr/local/lib
-        curl -s -H "Authorization: token $GH_TOKEN" curl -s https://api.github.com/repos/nimlgen/amdcomgr_dylib/releases/latest | \
+        curl -s -H "Authorization: token $GH_TOKEN" curl -s https://api.github.com/repos/tinygrad/amdcomgr_dylib/releases/latest | \
           jq -r '.assets[] | select(.name == "libamd_comgr.dylib").browser_download_url' | \
           sudo xargs curl -fL -o /usr/local/lib/libamd_comgr.dylib
         cargo build --release --manifest-path ./extra/remu/Cargo.toml
